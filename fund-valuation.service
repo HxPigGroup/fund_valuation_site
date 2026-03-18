@@ -1,0 +1,17 @@
+[Unit]
+Description=Fund Valuation Site
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/fund_valuation_site
+ExecStart=/root/miniconda3/envs/vnpy/bin/python /root/fund_valuation_site/app.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/root/fund_valuation_site/service.log
+StandardError=append:/root/fund_valuation_site/service.log
+
+[Install]
+WantedBy=multi-user.target
