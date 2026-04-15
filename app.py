@@ -3,16 +3,19 @@ from __future__ import annotations
 import json
 import multiprocessing as mp
 import os
+import re
 import threading
 import time
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timedelta
 from functools import partial
 from html import escape
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 import akshare as ak
+import requests
 
 try:
     import tushare as ts
@@ -25,6 +28,8 @@ TRACKED_FILE = BASE_DIR / 'tracked_funds.txt'
 CACHE_FILE = BASE_DIR / 'valuation_cache.json'
 STATUS_FILE = BASE_DIR / 'refresh_status.json'
 CATALOG_FILE = BASE_DIR / 'fund_catalog.json'
+USER_DATA_DIR = BASE_DIR / 'user_data'
+PUBLIC_PAGE_KEY = '__public__'
 
 
 def _load_env_file() -> None:
@@ -47,47 +52,91 @@ HOLDINGS_TIMEOUT_SECONDS = int(os.getenv('FUND_HOLDINGS_TIMEOUT_SECONDS', '12'))
 STOCK_SPOT_TIMEOUT_SECONDS = int(os.getenv('FUND_STOCK_SPOT_TIMEOUT_SECONDS', '18'))
 QUOTE_CACHE_TTL_SECONDS = int(os.getenv('FUND_QUOTE_CACHE_TTL_SECONDS', '300'))
 ESTIMATION_CACHE_TTL_SECONDS = int(os.getenv('FUND_ESTIMATION_CACHE_TTL_SECONDS', '300'))
+CODE_ESTIMATION_TIMEOUT_SECONDS = int(os.getenv('FUND_CODE_ESTIMATION_TIMEOUT_SECONDS', '6'))
+ESTIMATION_SYMBOLS = ('全部', '股票型', '混合型', '债券型', '指数型', 'QDII', 'ETF联接', 'LOF', '场内交易基金')
 
 _refresh_lock = threading.Lock()
+_refresh_queue_lock = threading.Lock()
 _tushare_lock = threading.Lock()
 _tushare_pro = None
 _quote_cache = {'updated_at': 0.0, 'rows': {}}
 _estimation_cache = {'updated_at': 0.0, 'rows': {}}
+_refresh_queue: deque[str] = deque()
+_queued_refresh_phones: set[str] = set()
+_active_refresh_phone = ''
+_refresh_worker_started = False
 
 
 class FundHandler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:
-        if self.path not in {'/', ''}:
+        parsed = urlparse(self.path)
+        if parsed.path not in {'/', ''}:
             self.send_error(404, 'Not Found')
             return
 
-        tracked_codes = _read_tracked_codes()
-        cache_payload = _read_json(CACHE_FILE, {})
-        cached_rows = cache_payload.get('rows', {}) if isinstance(cache_payload, dict) else {}
-        refreshed_at = cache_payload.get('refreshed_at', '') if isinstance(cache_payload, dict) else ''
-        status = _read_json(STATUS_FILE, {})
+        query = parse_qs(parsed.query)
+        raw_phone = query.get('phone', [''])[0]
+        phone = _normalize_phone(raw_phone)
         catalog_payload = _read_json(CATALOG_FILE, {})
         catalog = catalog_payload.get('items', []) if isinstance(catalog_payload, dict) else []
-        html = _render_page(tracked_codes, cached_rows, refreshed_at, status, catalog)
+
+        if phone:
+            _ensure_user_files(phone)
+            tracked_codes = _read_tracked_codes(phone)
+            cache_payload = _read_json(_cache_file(phone), {})
+            cached_rows = cache_payload.get('rows', {}) if isinstance(cache_payload, dict) else {}
+            refreshed_at = cache_payload.get('refreshed_at', '') if isinstance(cache_payload, dict) else ''
+            status = _read_json(_status_file(phone), {})
+            if tracked_codes and not cached_rows and status.get('status') != 'running':
+                _trigger_refresh(phone)
+                status = _read_json(_status_file(phone), {})
+            html = _render_page(phone, tracked_codes, cached_rows, refreshed_at, status, catalog, raw_phone=raw_phone)
+        else:
+            tracked_codes = _read_tracked_codes()
+            cache_payload = _read_json(CACHE_FILE, {})
+            cached_rows = cache_payload.get('rows', {}) if isinstance(cache_payload, dict) else {}
+            refreshed_at = cache_payload.get('refreshed_at', '') if isinstance(cache_payload, dict) else ''
+            status = _read_json(STATUS_FILE, {})
+            if tracked_codes and not cached_rows and status.get('status') != 'running':
+                _trigger_refresh()
+                status = _read_json(STATUS_FILE, {})
+            html = _render_page('', tracked_codes, cached_rows, refreshed_at, status, catalog, is_public=True, raw_phone=raw_phone)
 
         encoded = html.encode('utf-8')
         self.send_response(200)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
         self.send_header('Content-Length', str(len(encoded)))
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Expires', '0')
         self.end_headers()
         self.wfile.write(encoded)
 
     def do_POST(self) -> None:
+        parsed = urlparse(self.path)
         content_length = int(self.headers.get('Content-Length', '0'))
         raw = self.rfile.read(content_length).decode('utf-8')
         form = parse_qs(raw)
+        phone = _normalize_phone(form.get('phone', [''])[0])
         code = _normalize_code(form.get('code', [''])[0])
 
-        if self.path == '/refresh':
+        if parsed.path == '/refresh':
+            if phone:
+                _ensure_user_files(phone)
+                _trigger_refresh(phone)
+                return self._redirect_home(phone)
             _trigger_refresh()
             return self._redirect_home()
 
-        if self.path == '/tracked/add' and code:
+        if parsed.path == '/tracked/add' and code:
+            if phone:
+                _ensure_user_files(phone)
+                tracked = _read_tracked_codes(phone)
+                if code not in tracked:
+                    tracked.append(code)
+                    _write_tracked_codes(tracked, phone)
+                _trigger_refresh(phone)
+                return self._redirect_home(phone)
             tracked = _read_tracked_codes()
             if code not in tracked:
                 tracked.append(code)
@@ -95,7 +144,13 @@ class FundHandler(SimpleHTTPRequestHandler):
             _trigger_refresh()
             return self._redirect_home()
 
-        if self.path == '/tracked/delete' and code:
+        if parsed.path == '/tracked/delete' and code:
+            if phone:
+                _ensure_user_files(phone)
+                tracked = [item for item in _read_tracked_codes(phone) if item != code]
+                _write_tracked_codes(tracked, phone)
+                _trigger_refresh(phone)
+                return self._redirect_home(phone)
             tracked = [item for item in _read_tracked_codes() if item != code]
             _write_tracked_codes(tracked)
             _trigger_refresh()
@@ -103,14 +158,18 @@ class FundHandler(SimpleHTTPRequestHandler):
 
         self.send_error(400, 'Unsupported request')
 
-    def _redirect_home(self) -> None:
+    def _redirect_home(self, phone: str = '') -> None:
         self.send_response(303)
-        self.send_header('Location', '/')
+        if phone:
+            self.send_header('Location', f'/?phone={phone}')
+        else:
+            self.send_header('Location', '/')
         self.end_headers()
 
 
 def main() -> None:
     BASE_DIR.mkdir(parents=True, exist_ok=True)
+    USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
     TRACKED_FILE.touch(exist_ok=True)
     if not CACHE_FILE.exists():
         CACHE_FILE.write_text(json.dumps({'rows': {}, 'refreshed_at': ''}, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -119,8 +178,13 @@ def main() -> None:
     if not CATALOG_FILE.exists():
         CATALOG_FILE.write_text(json.dumps({'items': []}, ensure_ascii=False, indent=2), encoding='utf-8')
 
-    if not _read_json(CACHE_FILE, {}).get('rows'):
+    _start_refresh_worker()
+    if _read_tracked_codes() and not _read_json(CACHE_FILE, {}).get('rows'):
         _trigger_refresh()
+    for phone in _list_all_user_phones():
+        _ensure_user_files(phone)
+        if _read_tracked_codes(phone) and not _read_json(_cache_file(phone), {}).get('rows'):
+            _trigger_refresh(phone)
     _start_auto_refresh_loop()
 
     handler = partial(FundHandler, directory=str(BASE_DIR))
@@ -128,25 +192,63 @@ def main() -> None:
     server.serve_forever()
 
 
-def _trigger_refresh() -> None:
-    if _refresh_lock.locked():
-        _write_status('running', '已有基金估值刷新任务在执行')
-        return
+def _trigger_refresh(phone: str = '') -> None:
+    global _active_refresh_phone
 
-    def worker() -> None:
+    normalized_phone = _normalize_phone(phone)
+    scope_key = normalized_phone or PUBLIC_PAGE_KEY
+    if normalized_phone:
+        _ensure_user_files(normalized_phone)
+
+    with _refresh_queue_lock:
+        if scope_key == _active_refresh_phone or scope_key in _queued_refresh_phones:
+            _write_status('running', '已有基金估值刷新任务在执行', phone=normalized_phone)
+            return
+        _refresh_queue.append(scope_key)
+        _queued_refresh_phones.add(scope_key)
+
+    _write_status('running', '已加入刷新队列', phone=normalized_phone)
+
+
+def _start_refresh_worker() -> None:
+    global _refresh_worker_started
+
+    if _refresh_worker_started:
+        return
+    _refresh_worker_started = True
+    threading.Thread(target=_refresh_worker_loop, daemon=True).start()
+
+
+def _refresh_worker_loop() -> None:
+    global _active_refresh_phone
+
+    while True:
+        scope_key = ''
+        with _refresh_queue_lock:
+            if _refresh_queue:
+                scope_key = _refresh_queue.popleft()
+                _queued_refresh_phones.discard(scope_key)
+                _active_refresh_phone = scope_key
+        if not scope_key:
+            time.sleep(0.5)
+            continue
+
+        phone = '' if scope_key == PUBLIC_PAGE_KEY else scope_key
         with _refresh_lock:
             try:
-                _write_status('running', '正在刷新基金估值')
-                rows = _fetch_tracked_rows(_read_tracked_codes())
-                CACHE_FILE.write_text(
+                _write_status('running', '正在刷新基金估值', phone=phone)
+                rows = _fetch_tracked_rows(_read_tracked_codes(phone))
+                _cache_file(phone).write_text(
                     json.dumps({'rows': rows, 'refreshed_at': _now()}, ensure_ascii=False, indent=2),
                     encoding='utf-8',
                 )
-                _write_status('success', f'已刷新 {len(rows)} 只基金', _now())
+                _write_status('success', f'已刷新 {len(rows)} 只基金', _now(), phone=phone)
             except Exception as exc:
-                _write_status('error', str(exc))
-
-    threading.Thread(target=worker, daemon=True).start()
+                _write_status('error', str(exc), phone=phone)
+            finally:
+                with _refresh_queue_lock:
+                    if _active_refresh_phone == scope_key:
+                        _active_refresh_phone = ''
 
 
 def _fetch_tracked_rows(tracked_codes: list[str]) -> dict[str, dict]:
@@ -161,12 +263,21 @@ def _fetch_tracked_rows(tracked_codes: list[str]) -> dict[str, dict]:
     for code in tracked_codes:
         nav_item = _fetch_nav_info(code)
         estimate_item = estimate_map.get(code, {})
-        holdings, holdings_source = _fetch_holdings(code)
-        quotes, quote_source = _fetch_stock_quotes([item['stock_code'] for item in holdings[:10]])
-        self_estimate = _estimate_by_holdings(nav_item, holdings, quotes)
+        if estimate_item.get('estimate_value') is None:
+            code_estimate = _fetch_estimation_by_code(code)
+            if code_estimate.get('estimate_value') is not None:
+                estimate_item = code_estimate
+        has_official_estimate = estimate_item.get('estimate_value') is not None
+        self_estimate = None
+        holdings_source = 'none'
+        quote_source = 'none'
+        if not has_official_estimate:
+            holdings, holdings_source = _fetch_holdings(code)
+            quotes, quote_source = _fetch_stock_quotes([item['stock_code'] for item in holdings[:10]])
+            self_estimate = _estimate_by_holdings(nav_item, holdings, quotes)
         name = nav_item.get('name') or estimate_item.get('name') or catalog_name_map.get(code) or code
         source_parts = []
-        if estimate_item.get('estimate_value') is not None:
+        if has_official_estimate:
             source_parts.append('official')
         if self_estimate:
             source_parts.append(f'self:{holdings_source}+{quote_source}')
@@ -180,6 +291,7 @@ def _fetch_tracked_rows(tracked_codes: list[str]) -> dict[str, dict]:
             'estimate_growth': _format_percent(estimate_item.get('estimate_growth')),
             'published_nav': _format_value(nav_item.get('published_nav')),
             'published_growth': _format_percent(nav_item.get('published_growth')),
+            'month_growth': _format_percent(nav_item.get('month_growth')),
             'deviation': _format_percent(estimate_item.get('deviation')),
             'self_estimate_value': _format_value(self_estimate.get('value') if self_estimate else None),
             'self_estimate_growth': _format_percent(self_estimate.get('growth') if self_estimate else None),
@@ -197,32 +309,43 @@ def _fetch_nav_info(code: str) -> dict[str, float | str | None]:
     try:
         frame = ak.fund_open_fund_info_em(symbol=code, indicator='单位净值走势', period='1月')
         if not frame.empty:
-            tail = frame.tail(1).to_dict(orient='records')[0]
+            normalized = _sort_nav_frame(frame)
+            records = normalized.to_dict(orient='records')
+            tail = records[-1]
+            columns = normalized.columns.tolist()
+            nav_col = _pick_column(columns, '单位净值')
+            date_col = _pick_column(columns, '净值日期') or _pick_column(columns, '日期')
+            growth_col = _pick_column(columns, '日增长率')
             return {
                 'name': name,
-                'published_nav': _as_float(tail.get('单位净值')),
-                'published_growth': _as_float(tail.get('日增长率')),
+                'published_nav': _as_float(tail.get(nav_col)) if nav_col else None,
+                'published_growth': _as_float(tail.get(growth_col)) if growth_col else None,
+                'month_growth': _calc_recent_growth(records, nav_col, date_col) if nav_col else None,
             }
     except Exception:
         pass
 
     pro = _get_tushare_pro()
     if not pro:
-        return {'name': name, 'published_nav': None, 'published_growth': None}
-    for ts_code in _candidate_ts_codes(code):
+        return {'name': name, 'published_nav': None, 'published_growth': None, 'month_growth': None}
+    for ts_code in _candidate_fund_ts_codes(code):
         try:
-            df = pro.fund_nav(ts_code=ts_code, limit=1)
+            df = pro.fund_nav(ts_code=ts_code, limit=25)
         except Exception:
             continue
         if df is None or df.empty:
             continue
-        row = df.iloc[0].to_dict()
+        if 'nav_date' in df.columns:
+            df = df.sort_values('nav_date')
+        records = df.to_dict(orient='records')
+        row = records[-1]
         return {
             'name': name,
             'published_nav': _as_float(row.get('unit_nav')),
             'published_growth': _calc_pct(row.get('unit_nav'), row.get('pre_unit_nav')),
+            'month_growth': _calc_recent_growth(records, 'unit_nav', 'nav_date'),
         }
-    return {'name': name, 'published_nav': None, 'published_growth': None}
+    return {'name': name, 'published_nav': None, 'published_growth': None, 'month_growth': None}
 
 
 def _fetch_estimation_map_cached() -> dict[str, dict]:
@@ -231,32 +354,76 @@ def _fetch_estimation_map_cached() -> dict[str, dict]:
         return dict(_estimation_cache.get('rows', {}))
 
     estimate_map: dict[str, dict] = {}
-    try:
-        frame = ak.fund_value_estimation_em()
-    except Exception:
-        frame = None
-    if frame is not None and not frame.empty:
-        columns = frame.columns.tolist()
-        code_col = _pick_column(columns, '基金代码')
-        name_col = _pick_column(columns, '基金名称') or _pick_column(columns, '基金简称')
-        estimate_value_col = _pick_column(columns, '估算值')
-        estimate_growth_col = _pick_column(columns, '估算增长率')
-        deviation_col = _pick_column(columns, '估算偏差')
-        normalized = frame.copy()
-        normalized[code_col] = normalized[code_col].astype(str).str.zfill(6)
-        for record in normalized.to_dict(orient='records'):
-            code = str(record.get(code_col, '')).zfill(6)
-            if not code:
-                continue
-            estimate_map[code] = {
-                'name': str(record.get(name_col, '') if name_col else '').strip(),
-                'estimate_value': _as_float(record.get(estimate_value_col)) if estimate_value_col else None,
-                'estimate_growth': _as_float(record.get(estimate_growth_col)) if estimate_growth_col else None,
-                'deviation': _as_float(record.get(deviation_col)) if deviation_col else None,
-            }
+    for symbol in ESTIMATION_SYMBOLS:
+        try:
+            frame = ak.fund_value_estimation_em(symbol=symbol)
+        except Exception:
+            continue
+        _merge_estimation_frame(estimate_map, frame, symbol)
     _estimation_cache['updated_at'] = now
     _estimation_cache['rows'] = estimate_map
     return dict(estimate_map)
+
+
+def _merge_estimation_frame(estimate_map: dict[str, dict], frame, symbol: str) -> None:
+    if frame is None or frame.empty:
+        return
+    columns = frame.columns.tolist()
+    code_col = _pick_column(columns, '基金代码')
+    if not code_col:
+        return
+    name_col = _pick_column(columns, '基金名称') or _pick_column(columns, '基金简称')
+    estimate_value_col = _pick_column(columns, '估算值')
+    estimate_growth_col = _pick_column(columns, '估算增长率')
+    deviation_col = _pick_column(columns, '估算偏差')
+    normalized = frame.copy()
+    normalized[code_col] = normalized[code_col].astype(str).str.zfill(6)
+    for record in normalized.to_dict(orient='records'):
+        code = str(record.get(code_col, '')).zfill(6)
+        if not code:
+            continue
+        item = {
+            'name': str(record.get(name_col, '') if name_col else '').strip(),
+            'estimate_value': _as_float(record.get(estimate_value_col)) if estimate_value_col else None,
+            'estimate_growth': _as_float(record.get(estimate_growth_col)) if estimate_growth_col else None,
+            'deviation': _as_float(record.get(deviation_col)) if deviation_col else None,
+            'source': f'eastmoney:{symbol}',
+        }
+        existing = estimate_map.get(code, {})
+        if existing.get('estimate_value') is not None:
+            continue
+        if item.get('estimate_value') is not None:
+            estimate_map[code] = item
+        elif code not in estimate_map:
+            estimate_map[code] = item
+
+
+def _fetch_estimation_by_code(code: str) -> dict:
+    url = f'https://fundgz.1234567.com.cn/js/{code}.js?rt={int(time.time() * 1000)}'
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://fund.eastmoney.com/',
+    }
+    for _ in range(2):
+        try:
+            text = requests.get(url, headers=headers, timeout=CODE_ESTIMATION_TIMEOUT_SECONDS).text.strip()
+        except Exception:
+            continue
+        match = re.search(r'jsonpgz\((.*)\);?$', text)
+        if not match:
+            continue
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        return {
+            'name': str(payload.get('name') or '').strip(),
+            'estimate_value': _as_float(payload.get('gsz')),
+            'estimate_growth': _as_float(payload.get('gszzl')),
+            'deviation': None,
+            'source': 'eastmoney:code',
+        }
+    return {}
 
 
 def _fetch_holdings(code: str) -> tuple[list[dict], str]:
@@ -320,7 +487,7 @@ def _fetch_holdings_tushare(code: str) -> list[dict]:
     if not pro:
         return []
     best = []
-    for ts_code in _candidate_ts_codes(code):
+    for ts_code in _candidate_fund_ts_codes(code):
         try:
             df = pro.fund_portfolio(ts_code=ts_code)
         except Exception:
@@ -491,7 +658,58 @@ def _candidate_ts_codes(code: str) -> list[str]:
     return [f'{code}.SZ', f'{code}.SH']
 
 
-def _render_page(tracked_codes: list[str], cached_rows: dict[str, dict], refreshed_at: str, status: dict, catalog: list[dict]) -> str:
+def _candidate_fund_ts_codes(code: str) -> list[str]:
+    candidates = [f'{code}.OF', *_candidate_ts_codes(code)]
+    return list(dict.fromkeys(candidates))
+
+
+def _render_phone_entry_page(raw_phone: str = '', show_error: bool = False) -> str:
+    error_text = "<p class='status error'>请输入 11 位手机号后再进入个人页面。</p>" if show_error else ''
+    return f"""<!doctype html>
+<html lang='zh-CN'>
+<head>
+  <meta charset='utf-8'>
+  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <title>进入个人基金页</title>
+  <style>
+    :root {{ --bg:#f5f7fb; --ink:#101828; --muted:#475467; --line:#d0d5dd; --card:#ffffff; --brand:#1570ef; --danger:#d92d20; }}
+    body {{ margin:0; font-family:"IBM Plex Sans","PingFang SC","Microsoft YaHei",sans-serif; background:linear-gradient(180deg,#f8fbff 0%,var(--bg) 100%); color:var(--ink); }}
+    main {{ max-width:820px; margin:0 auto; padding:48px 20px 72px; }}
+    .card {{ background:var(--card); border:1px solid var(--line); border-radius:18px; padding:22px; box-shadow:0 12px 28px rgba(16,24,40,.06); }}
+    .sub {{ color:var(--muted); line-height:1.8; }}
+    .status.error {{ color:var(--danger); margin:12px 0; }}
+    form.inline {{ display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin:20px 0 12px; }}
+    input[type=text] {{ border:1px solid var(--line); border-radius:12px; padding:12px 14px; min-width:280px; font-size:15px; }}
+    button {{ border:none; border-radius:12px; padding:12px 18px; background:var(--brand); color:white; cursor:pointer; }}
+  </style>
+</head>
+<body>
+  <main>
+    <section class='card'>
+      <h1>按手机号进入个人基金跟踪页</h1>
+      <p class='sub'>输入手机号后会打开专属页面。每个手机号有独立的基金列表、刷新状态和缓存结果，互不影响；新手机号首次进入默认是空白列表。</p>
+      <form class='inline' method='get' action='/'>
+        <input type='text' name='phone' value='{escape(raw_phone)}' inputmode='numeric' placeholder='输入 11 位手机号' required>
+        <button type='submit'>进入我的页面</button>
+      </form>
+      {error_text}
+      <p class='sub'>当前实现里，手机号只作为页面标识，不做短信验证码校验。</p>
+    </section>
+  </main>
+</body>
+</html>"""
+
+
+def _render_page(
+    phone: str,
+    tracked_codes: list[str],
+    cached_rows: dict[str, dict],
+    refreshed_at: str,
+    status: dict,
+    catalog: list[dict],
+    is_public: bool = False,
+    raw_phone: str = '',
+) -> str:
     if status.get('status') == 'running':
         status_text = f"<p class='status'>基金估值刷新中，最近触发时间 {escape(str(status.get('updated_at', '')))}。</p>"
     elif status.get('status') == 'success':
@@ -500,6 +718,12 @@ def _render_page(tracked_codes: list[str], cached_rows: dict[str, dict], refresh
         status_text = f"<p class='status error'>刷新失败：{escape(str(status.get('message', '未知错误')))}</p>"
     else:
         status_text = ''
+    if is_public and raw_phone and not _normalize_phone(raw_phone):
+        status_text += "<p class='status error'>请输入 11 位手机号后再进入个人页面。</p>"
+    if not tracked_codes and is_public:
+        status_text += "<p class='sub'>公共页面暂时还没有跟踪基金，可以直接在下面添加。</p>"
+    elif not tracked_codes:
+        status_text += "<p class='sub'>这是一个空白个人页，先输入基金代码加入跟踪，后续这个手机号只会看到自己的列表。</p>"
 
     refresh_disabled = 'disabled' if status.get('status') == 'running' else ''
     refresh_label = '刷新中...' if status.get('status') == 'running' else '立即刷新估值'
@@ -507,25 +731,37 @@ def _render_page(tracked_codes: list[str], cached_rows: dict[str, dict], refresh
         f"<option value=\"{escape(str(item.get('code', '')))}\">{escape(str(item.get('code', '')))} {escape(str(item.get('name', '')))}</option>"
         for item in catalog[:800]
     )
+    delete_phone_hidden_input = f"<input type='hidden' name='phone' value='{escape(phone)}'>" if phone else ''
+    sorted_codes = _sort_codes_by_estimate_growth(tracked_codes, cached_rows)
     rows_html = []
-    for code in tracked_codes:
+    for code in sorted_codes:
         row = cached_rows.get(code, {})
+        estimate_growth_class = _tone_class(row.get('estimate_growth'))
+        self_estimate_growth_class = _tone_class(row.get('self_estimate_growth'))
+        published_growth_class = _tone_class(row.get('published_growth'))
+        month_growth_class = _tone_class(row.get('month_growth'))
+        estimate_growth_cell_class = f"primary-col {estimate_growth_class}".strip()
+        estimate_value_text = _blank_if_empty(row.get('estimate_value'))
+        estimate_growth_text = _blank_if_empty(row.get('estimate_growth'))
+        estimate_growth_html = (
+            escape(estimate_growth_text)
+            if estimate_growth_text
+            else "<span class='empty-hint'>暂无官方估算，点“显示扩展列”看自算</span>"
+        )
         rows_html.append(
             f"""
             <tr>
               <td>{escape(code)}</td>
               <td>{escape(str(row.get('name', '---')))}</td>
-              <td>{escape(str(row.get('estimate_value', '---')))}</td>
-              <td>{escape(str(row.get('estimate_growth', '---')))}</td>
-              <td>{escape(str(row.get('self_estimate_value', '---')))}</td>
-              <td>{escape(str(row.get('self_estimate_growth', '---')))}</td>
-              <td>{escape(str(row.get('holdings_coverage', '---')))}</td>
-              <td>{escape(str(row.get('published_nav', '---')))}</td>
-              <td>{escape(str(row.get('published_growth', '---')))}</td>
-              <td>{escape(str(row.get('deviation', '---')))}</td>
-              <td>{escape(str(row.get('estimate_source', '---')))}</td>
+              <td>{escape(estimate_value_text)}</td>
+              <td class='{estimate_growth_cell_class}'>{estimate_growth_html}</td>
+              <td class='optional-col'>{escape(str(row.get('self_estimate_value', '---')))}</td>
+              <td class='optional-col {self_estimate_growth_class}'>{escape(str(row.get('self_estimate_growth', '---')))}</td>
+              <td class='{published_growth_class}'>{escape(str(row.get('published_growth', '---')))}</td>
+              <td class='{month_growth_class}'>{escape(str(row.get('month_growth', '---')))}</td>
               <td>
                 <form method='post' action='/tracked/delete'>
+                  {delete_phone_hidden_input}
                   <input type='hidden' name='code' value='{escape(code)}'>
                   <button type='submit' class='danger'>删除</button>
                 </form>
@@ -533,14 +769,36 @@ def _render_page(tracked_codes: list[str], cached_rows: dict[str, dict], refresh
             </tr>
             """
         )
-    table_html = '\n'.join(rows_html) or "<tr><td colspan='12'>当前没有跟踪的基金。</td></tr>"
-    meta_refresh = "<meta http-equiv='refresh' content='8'>" if status.get('status') == 'running' else ''
+    table_html = '\n'.join(rows_html) or "<tr><td colspan='9'>当前没有跟踪的基金。</td></tr>"
+    masked_phone = _mask_phone(phone)
+    page_desc = (
+        f"个人页：{escape(masked_phone)} | 页面标识：{escape(phone)} | 最近缓存时间: {escape(refreshed_at or '暂无')} | 自动刷新间隔: {AUTO_REFRESH_SECONDS // 60} 分钟"
+        if phone
+        else f"公共页面 | 最近缓存时间: {escape(refreshed_at or '暂无')} | 自动刷新间隔: {AUTO_REFRESH_SECONDS // 60} 分钟"
+    )
+    page_tools = (
+        f"""
+      <form class='inline' method='get' action='/'>
+        <input type='text' name='phone' value='{escape(phone)}' inputmode='numeric' placeholder='输入 11 位手机号' required>
+        <button type='submit'>切换个人页面</button>
+      </form>
+      <form class='inline' method='get' action='/'><button type='submit'>回到公共页面</button></form>
+        """
+        if phone
+        else f"""
+      <form class='inline' method='get' action='/'>
+        <input type='text' name='phone' value='{escape(raw_phone)}' inputmode='numeric' placeholder='输入 11 位手机号进入个人页面'>
+        <button type='submit'>进入个人页面</button>
+      </form>
+        """
+    )
+    phone_hidden_input = f"<input type='hidden' name='phone' value='{escape(phone)}'>" if phone else ''
+    extra_columns_toggle = "<button type='button' id='toggle-extra-columns' class='secondary' onclick='toggleExtraColumns()'>显示扩展列</button>"
     return f"""<!doctype html>
 <html lang='zh-CN'>
 <head>
   <meta charset='utf-8'>
   <meta name='viewport' content='width=device-width, initial-scale=1'>
-  {meta_refresh}
   <title>基金估值跟踪</title>
   <style>
     :root {{ --bg:#f5f7fb; --ink:#101828; --muted:#475467; --line:#d0d5dd; --card:#ffffff; --brand:#1570ef; --danger:#d92d20; }}
@@ -553,9 +811,16 @@ def _render_page(tracked_codes: list[str], cached_rows: dict[str, dict], refresh
     button {{ border:none; border-radius:12px; padding:10px 16px; background:var(--brand); color:white; cursor:pointer; }}
     button:disabled {{ opacity:.6; cursor:wait; }}
     button.danger {{ background:var(--danger); }}
+    button.secondary {{ background:#eaf2ff; color:#175cd3; }}
     table {{ width:100%; border-collapse:collapse; }}
     th,td {{ border-bottom:1px solid #eaecf0; padding:10px 8px; text-align:left; font-size:14px; white-space:nowrap; }}
     th {{ color:var(--muted); }}
+    th.primary-col, td.primary-col {{ font-weight:700; }}
+    td.up {{ color:#d92d20; font-weight:600; }}
+    td.down {{ color:#027a48; font-weight:600; }}
+    .empty-hint {{ display:inline-block; max-width:160px; color:var(--muted); font-size:12px; font-weight:500; line-height:1.45; white-space:normal; }}
+    .optional-col {{ display:none; }}
+    body.show-extra-columns .optional-col {{ display:table-cell; }}
     .status {{ color:var(--brand); margin:12px 0; }}
     .status.error {{ color:var(--danger); }}
     .scroll {{ overflow-x:auto; }}
@@ -565,27 +830,44 @@ def _render_page(tracked_codes: list[str], cached_rows: dict[str, dict], refresh
   <main>
     <section class='card'>
       <h1>基金估值跟踪</h1>
-      <p class='sub'>端口 11452 | 最近缓存时间: {escape(refreshed_at or '暂无')} | 自动刷新间隔: {AUTO_REFRESH_SECONDS // 60} 分钟</p>
+      <p class='sub'>{page_desc}</p>
+      {page_tools}
       <form class='inline' method='post' action='/tracked/add'>
+        {phone_hidden_input}
         <input type='text' name='code' placeholder='输入基金代码，例如 161725' list='fund-catalog' required>
         <button type='submit'>加入跟踪</button>
       </form>
       <datalist id='fund-catalog'>{catalog_options}</datalist>
-      <form class='inline' method='post' action='/refresh'><button type='submit' {refresh_disabled}>{refresh_label}</button></form>
+      <form class='inline' method='post' action='/refresh'>
+        {phone_hidden_input}
+        <button type='submit' {refresh_disabled}>{refresh_label}</button>
+      </form>
+      <form class='inline' onsubmit='return false;'>
+        {extra_columns_toggle}
+      </form>
       {status_text}
-      <p class='sub'>AkShare 和 Tushare 会按顺序回退尝试；成功一个就用，并带缓存节流，避免请求过于频繁。</p>
+      <p class='sub'>默认按官方估算涨跌从大到小排序。官方估值会合并东方财富多个分类；若官方估算为空，可点“显示扩展列”查看自算估值，但自算只基于滞后的十大持仓，偏差会比较大，仅适合粗略参考。</p>
     </section>
     <section class='card scroll'>
       <table>
         <thead>
           <tr>
-            <th>基金代码</th><th>基金名称</th><th>官方估算值</th><th>官方估算涨跌</th><th>自算估值</th><th>自算涨跌</th><th>持仓覆盖</th><th>公布净值</th><th>公布日增长率</th><th>估算偏差</th><th>估值来源</th><th>操作</th>
+            <th>基金代码</th><th>基金名称</th><th>官方估算值</th><th class='primary-col'>官方估算涨跌</th><th class='optional-col'>自算估值</th><th class='optional-col'>自算涨跌</th><th>昨日增长</th><th>近一月增长</th><th>操作</th>
           </tr>
         </thead>
         <tbody>{table_html}</tbody>
       </table>
     </section>
   </main>
+  <script>
+    function toggleExtraColumns() {{
+      document.body.classList.toggle('show-extra-columns');
+      var button = document.getElementById('toggle-extra-columns');
+      if (button) {{
+        button.textContent = document.body.classList.contains('show-extra-columns') ? '隐藏扩展列' : '显示扩展列';
+      }}
+    }}
+  </script>
 </body>
 </html>"""
 
@@ -595,13 +877,95 @@ def _normalize_code(code: str) -> str:
     return normalized.zfill(6) if normalized else ''
 
 
-def _read_tracked_codes() -> list[str]:
-    if not TRACKED_FILE.exists():
+def _normalize_phone(phone: str) -> str:
+    normalized = ''.join(ch for ch in phone.strip() if ch.isdigit())
+    return normalized if len(normalized) == 11 else ''
+
+
+def _mask_phone(phone: str) -> str:
+    if len(phone) != 11:
+        return phone
+    return f'{phone[:3]}****{phone[-4:]}'
+
+
+def _user_dir(phone: str) -> Path:
+    return USER_DATA_DIR / phone
+
+
+def _tracked_file(phone: str = '') -> Path:
+    return _user_dir(phone) / 'tracked_funds.txt' if phone else TRACKED_FILE
+
+
+def _cache_file(phone: str = '') -> Path:
+    return _user_dir(phone) / 'valuation_cache.json' if phone else CACHE_FILE
+
+
+def _status_file(phone: str = '') -> Path:
+    return _user_dir(phone) / 'refresh_status.json' if phone else STATUS_FILE
+
+
+def _list_all_user_phones() -> list[str]:
+    if not USER_DATA_DIR.exists():
         return []
-    return [line.strip() for line in TRACKED_FILE.read_text(encoding='utf-8').splitlines() if line.strip()]
+    phones = []
+    for item in USER_DATA_DIR.iterdir():
+        if item.is_dir():
+            phone = _normalize_phone(item.name)
+            if phone:
+                phones.append(phone)
+    return sorted(set(phones))
 
 
-def _write_tracked_codes(codes: list[str]) -> None:
+def _ensure_user_files(phone: str) -> None:
+    normalized_phone = _normalize_phone(phone)
+    if not normalized_phone:
+        return
+
+    user_dir = _user_dir(normalized_phone)
+    user_dir.mkdir(parents=True, exist_ok=True)
+
+    tracked_path = _tracked_file(normalized_phone)
+    if not tracked_path.exists():
+        tracked_path.write_text('', encoding='utf-8')
+
+    cache_path = _cache_file(normalized_phone)
+    if not cache_path.exists():
+        cache_path.write_text(json.dumps({'rows': {}, 'refreshed_at': ''}, ensure_ascii=False, indent=2), encoding='utf-8')
+
+    status_path = _status_file(normalized_phone)
+    if not status_path.exists():
+        _write_status('idle', '等待刷新', phone=normalized_phone)
+
+    _migrate_seeded_user_page(normalized_phone)
+
+
+def _migrate_seeded_user_page(phone: str) -> None:
+    normalized_phone = _normalize_phone(phone)
+    if not normalized_phone:
+        return
+
+    template_codes = _read_tracked_codes()
+    user_codes = _read_tracked_codes(normalized_phone)
+    cache_payload = _read_json(_cache_file(normalized_phone), {})
+    cached_rows = cache_payload.get('rows', {}) if isinstance(cache_payload, dict) else {}
+    refreshed_at = cache_payload.get('refreshed_at', '') if isinstance(cache_payload, dict) else ''
+
+    if not user_codes or user_codes != template_codes or cached_rows or refreshed_at:
+        return
+
+    _tracked_file(normalized_phone).write_text('', encoding='utf-8')
+    _cache_file(normalized_phone).write_text(json.dumps({'rows': {}, 'refreshed_at': ''}, ensure_ascii=False, indent=2), encoding='utf-8')
+    _write_status('idle', '等待添加基金', phone=normalized_phone)
+
+
+def _read_tracked_codes(phone: str = '') -> list[str]:
+    path = _tracked_file(phone)
+    if not path.exists():
+        return []
+    return [line.strip() for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
+
+
+def _write_tracked_codes(codes: list[str], phone: str = '') -> None:
     unique_codes: list[str] = []
     for code in codes:
         normalized = _normalize_code(code)
@@ -610,7 +974,7 @@ def _write_tracked_codes(codes: list[str]) -> None:
     body = '\n'.join(unique_codes)
     if body:
         body += '\n'
-    TRACKED_FILE.write_text(body, encoding='utf-8')
+    _tracked_file(phone).write_text(body, encoding='utf-8')
 
 
 def _read_json(path: Path, default):
@@ -622,9 +986,9 @@ def _read_json(path: Path, default):
         return default
 
 
-def _write_status(status: str, message: str, updated_at: str = '') -> None:
+def _write_status(status: str, message: str, updated_at: str = '', phone: str = '') -> None:
     payload = {'status': status, 'message': message, 'updated_at': updated_at or _now()}
-    STATUS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    _status_file(phone).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
 def _read_catalog_name(code: str) -> str:
@@ -657,6 +1021,53 @@ def _pick_column(columns: list[str], keyword: str) -> str:
     return ''
 
 
+def _sort_nav_frame(frame):
+    date_col = _pick_column(frame.columns.tolist(), '净值日期') or _pick_column(frame.columns.tolist(), '日期')
+    if not date_col:
+        return frame
+    try:
+        return frame.sort_values(date_col)
+    except Exception:
+        return frame
+
+
+def _calc_recent_growth(records: list[dict], nav_col: str, date_col: str = '') -> float | None:
+    points: list[tuple[datetime | None, float]] = []
+    for record in records:
+        nav = _as_float(record.get(nav_col))
+        if nav is None:
+            continue
+        date_value = _parse_date(record.get(date_col)) if date_col else None
+        points.append((date_value, nav))
+    if len(points) < 2:
+        return None
+
+    latest_date, latest_nav = points[-1]
+    start_nav = None
+    if latest_date is not None:
+        cutoff = latest_date - timedelta(days=30)
+        for point_date, nav in points:
+            if point_date is not None and point_date <= cutoff:
+                start_nav = nav
+            elif point_date is not None and point_date > cutoff:
+                break
+    if start_nav is None:
+        start_nav = points[-22][1] if len(points) >= 22 else points[0][1]
+    return _calc_pct(latest_nav, start_nav)
+
+
+def _parse_date(value) -> datetime | None:
+    text = str(value or '').strip()
+    if not text:
+        return None
+    for fmt in ('%Y-%m-%d', '%Y%m%d'):
+        try:
+            return datetime.strptime(text[:10] if '-' in text else text[:8], fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def _as_float(value):
     if value is None:
         return None
@@ -687,6 +1098,30 @@ def _format_percent(value) -> str:
     return f'{number:.2f}%' if number is not None else '---'
 
 
+def _blank_if_empty(value) -> str:
+    text = str(value or '').strip()
+    return '' if text in {'', '---', 'None', 'nan'} else text
+
+
+def _tone_class(value) -> str:
+    number = _as_float(value)
+    if number is None:
+        return ''
+    if number > 0:
+        return 'up'
+    if number < 0:
+        return 'down'
+    return ''
+
+
+def _sort_codes_by_estimate_growth(tracked_codes: list[str], cached_rows: dict[str, dict]) -> list[str]:
+    def sort_key(code: str) -> tuple[bool, float]:
+        value = _as_float(cached_rows.get(code, {}).get('estimate_growth'))
+        return (value is not None, value if value is not None else float('-inf'))
+
+    return sorted(tracked_codes, key=sort_key, reverse=True)
+
+
 def _now() -> str:
     return datetime.now().isoformat(timespec='seconds')
 
@@ -696,6 +1131,8 @@ def _start_auto_refresh_loop() -> None:
         while True:
             time.sleep(AUTO_REFRESH_SECONDS)
             _trigger_refresh()
+            for phone in _list_all_user_phones():
+                _trigger_refresh(phone)
     threading.Thread(target=worker, daemon=True).start()
 
 
