@@ -10,12 +10,15 @@ from collections import deque
 from datetime import datetime, timedelta
 from functools import partial
 from html import escape
+from io import StringIO
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import akshare as ak
+import pandas as pd
 import requests
+from akshare.utils import demjson
 
 try:
     import tushare as ts
@@ -59,6 +62,8 @@ UPSTREAM_READ_TIMEOUT_SECONDS = int(os.getenv('FUND_UPSTREAM_READ_TIMEOUT_SECOND
 TUSHARE_TIMEOUT_SECONDS = int(os.getenv('FUND_TUSHARE_TIMEOUT_SECONDS', '12'))
 ESTIMATION_PAGE_SIZE = 20000
 ESTIMATION_MAX_PAGES = 5
+SELF_ESTIMATE_HISTORY_DAYS = int(os.getenv('FUND_SELF_ESTIMATE_HISTORY_DAYS', '5'))
+TUSHARE_DAILY_LOOKBACK_DAYS = int(os.getenv('FUND_TUSHARE_DAILY_LOOKBACK_DAYS', '20'))
 ESTIMATION_SYMBOLS = ('全部', '股票型', '混合型', '债券型', '指数型', 'QDII', 'ETF联接', 'LOF', '场内交易基金')
 
 _refresh_lock = threading.Lock()
@@ -347,7 +352,7 @@ def _fetch_tracked_rows(tracked_codes: list[str]) -> dict[str, dict]:
     return rows
 
 
-def _fetch_nav_info(code: str) -> dict[str, float | str | None]:
+def _fetch_nav_info(code: str) -> dict[str, object]:
     name = _read_catalog_name(code)
     try:
         url = 'https://api.fund.eastmoney.com/f10/lsjz'
@@ -367,11 +372,17 @@ def _fetch_nav_info(code: str) -> dict[str, float | str | None]:
         if raw_records:
             records = list(reversed(raw_records))
             latest = records[-1]
+            nav_history = [
+                {'date': str(item.get('FSRQ') or '').strip(), 'nav': _as_float(item.get('DWJZ'))}
+                for item in records
+                if _as_float(item.get('DWJZ')) is not None
+            ]
             return {
                 'name': name,
                 'published_nav': _as_float(latest.get('DWJZ')),
                 'published_growth': _as_float(latest.get('JZZZL')),
                 'month_growth': _calc_recent_growth(records, 'DWJZ', 'FSRQ'),
+                'nav_history': nav_history[-12:],
             }
     except (requests.RequestException, ValueError, TypeError, AttributeError):
         pass
@@ -379,7 +390,7 @@ def _fetch_nav_info(code: str) -> dict[str, float | str | None]:
     return _fetch_nav_info_tushare(code, name)
 
 
-def _fetch_nav_info_tushare(code: str, name: str) -> dict[str, float | str | None]:
+def _fetch_nav_info_tushare(code: str, name: str) -> dict[str, object]:
     ctx = mp.get_context('fork')
     queue: mp.Queue = ctx.Queue()
     process = ctx.Process(target=_nav_worker_tushare, args=(code, name, queue))
@@ -413,11 +424,17 @@ def _nav_worker_tushare(code: str, name: str, queue: mp.Queue) -> None:
                 df = df.sort_values('nav_date')
             records = df.to_dict(orient='records')
             row = records[-1]
+            nav_history = [
+                {'date': str(item.get('nav_date') or '').strip(), 'nav': _as_float(item.get('unit_nav'))}
+                for item in records
+                if _as_float(item.get('unit_nav')) is not None
+            ]
             queue.put({
                 'name': name,
                 'published_nav': _as_float(row.get('unit_nav')),
                 'published_growth': _calc_pct(row.get('unit_nav'), row.get('pre_unit_nav')),
                 'month_growth': _calc_recent_growth(records, 'unit_nav', 'nav_date'),
+                'nav_history': nav_history[-12:],
             })
             return
         queue.put(None)
@@ -590,29 +607,91 @@ def _holdings_worker_akshare(code: str, queue: mp.Queue) -> None:
         years = [str(datetime.now().year), str(datetime.now().year - 1), str(datetime.now().year - 2)]
         for year in years:
             try:
-                frame = ak.fund_portfolio_hold_em(symbol=code, date=year)
+                items = _fetch_holdings_year(code, year)
             except Exception:
                 continue
-            if frame is None or frame.empty:
-                continue
-            code_col = _pick_column(frame.columns.tolist(), '股票代码') or _pick_column(frame.columns.tolist(), '代码')
-            weight_col = _pick_column(frame.columns.tolist(), '占净值比例') or _pick_column(frame.columns.tolist(), '占净值比')
-            name_col = _pick_column(frame.columns.tolist(), '股票名称') or _pick_column(frame.columns.tolist(), '名称')
-            if not code_col or not weight_col:
-                continue
-            items = []
-            for record in frame.to_dict(orient='records'):
-                stock_code = _normalize_code(str(record.get(code_col, '')))
-                weight = _as_float(record.get(weight_col))
-                if not stock_code or weight is None or weight <= 0:
-                    continue
-                items.append({'stock_code': stock_code, 'stock_name': str(record.get(name_col, '') if name_col else '').strip(), 'weight': weight})
-            items.sort(key=lambda item: float(item['weight']), reverse=True)
-            queue.put(items)
-            return
+            if items:
+                queue.put(items)
+                return
         queue.put([])
     except Exception:
         queue.put([])
+
+
+def _fetch_holdings_year(code: str, year: str) -> list[dict]:
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+    page_url = f'https://fundf10.eastmoney.com/ccmx_{code}.html'
+    session.get(
+        page_url,
+        timeout=(UPSTREAM_CONNECT_TIMEOUT_SECONDS, UPSTREAM_READ_TIMEOUT_SECONDS),
+        proxies={},
+    )
+    response = session.get(
+        'https://fundf10.eastmoney.com/FundArchivesDatas.aspx',
+        params={
+            'type': 'jjcc',
+            'code': code,
+            'topline': '10000',
+            'year': year,
+            'month': '',
+            'rt': '0.913877030254846',
+        },
+        headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': page_url,
+        },
+        timeout=(UPSTREAM_CONNECT_TIMEOUT_SECONDS, UPSTREAM_READ_TIMEOUT_SECONDS),
+        proxies={},
+    )
+    if response.status_code != 200:
+        return []
+    text = response.text.strip()
+    if not text or '{' not in text:
+        return []
+    payload = demjson.decode(text[text.find('{'):-1])
+    content = str(payload.get('content') or '').strip()
+    if not content:
+        return []
+    try:
+        tables = pd.read_html(StringIO(content), converters={'股票代码': str})
+    except Exception:
+        return []
+    if not tables:
+        return []
+    frame = tables[0]
+    if frame is None or frame.empty:
+        return []
+    if '相关资讯' in frame.columns:
+        frame = frame.drop(columns=['相关资讯'])
+    rename_map = {
+        '占净值 比例': '占净值比例',
+        '持股数（万股）': '持股数',
+        '持股数 （万股）': '持股数',
+        '持仓市值（万元）': '持仓市值',
+        '持仓市值 （万元）': '持仓市值',
+        '持仓市值（万元人民币）': '持仓市值',
+        '持仓市值 （万元人民币）': '持仓市值',
+    }
+    frame = frame.rename(columns=rename_map)
+    code_col = _pick_column(frame.columns.tolist(), '股票代码') or _pick_column(frame.columns.tolist(), '代码')
+    weight_col = _pick_column(frame.columns.tolist(), '占净值比例') or _pick_column(frame.columns.tolist(), '占净值比')
+    name_col = _pick_column(frame.columns.tolist(), '股票名称') or _pick_column(frame.columns.tolist(), '名称')
+    if not code_col or not weight_col:
+        return []
+    items = []
+    for record in frame.to_dict(orient='records'):
+        stock_code = _normalize_code(str(record.get(code_col, '')))
+        weight = _as_float(record.get(weight_col))
+        if not stock_code or weight is None or weight <= 0:
+            continue
+        items.append({
+            'stock_code': stock_code,
+            'stock_name': str(record.get(name_col, '') if name_col else '').strip(),
+            'weight': weight,
+        })
+    items.sort(key=lambda item: float(item['weight']), reverse=True)
+    return items
 
 
 def _fetch_holdings_tushare(code: str) -> list[dict]:
@@ -657,17 +736,17 @@ def _fetch_stock_quotes(codes: list[str]) -> tuple[dict[str, dict], str]:
         if subset:
             return subset, 'cache'
 
+    quotes = _fetch_stock_quotes_tushare(needed)
+    if quotes:
+        _quote_cache['updated_at'] = now
+        _quote_cache['rows'] = {**cached_rows, **quotes}
+        return quotes, 'tushare_daily'
+
     quotes = _fetch_stock_quotes_akshare(needed)
     if quotes:
         _quote_cache['updated_at'] = now
         _quote_cache['rows'] = {**cached_rows, **quotes}
         return quotes, 'akshare'
-
-    quotes = _fetch_stock_quotes_tushare(needed)
-    if quotes:
-        _quote_cache['updated_at'] = now
-        _quote_cache['rows'] = {**cached_rows, **quotes}
-        return quotes, 'tushare'
 
     subset = {code: cached_rows[code] for code in needed if code in cached_rows}
     if subset:
@@ -716,35 +795,59 @@ def _stock_quotes_worker_akshare(codes: list[str], queue: mp.Queue) -> None:
 def _fetch_stock_quotes_tushare(codes: list[str]) -> dict[str, dict]:
     if ts is None or not codes:
         return {}
-    ts_codes = ','.join(_candidate_ts_codes(code)[0] for code in codes)
-    try:
-        df = ts.realtime_quote(ts_code=ts_codes)
-    except Exception:
-        return {}
-    if df is None or df.empty:
-        return {}
+    end_date = datetime.now().strftime('%Y%m%d')
+    start_date = (datetime.now() - timedelta(days=TUSHARE_DAILY_LOOKBACK_DAYS)).strftime('%Y%m%d')
     rows = {}
-    for record in df.to_dict(orient='records'):
-        raw_ts_code = str(record.get('TS_CODE') or record.get('ts_code') or '').strip()
-        code = _normalize_code(raw_ts_code.split('.')[0])
-        if not code:
-            continue
-        price = _as_float(record.get('PRICE') or record.get('price') or record.get('current'))
-        pre_close = _as_float(record.get('PRE_CLOSE') or record.get('pre_close'))
-        pct_change = _as_float(record.get('PCT_CHANGE') or record.get('pct_change'))
-        if pct_change is None:
-            pct_change = _calc_pct(price, pre_close)
-        rows[code] = {'name': str(record.get('NAME') or record.get('name') or '').strip(), 'pct_change': pct_change}
+    for code in codes:
+        item = _fetch_stock_daily_tushare(code, start_date, end_date)
+        if item:
+            rows[code] = item
     return rows
+
+
+def _fetch_stock_daily_tushare(code: str, start_date: str, end_date: str) -> dict:
+    pro = _get_tushare_pro()
+    if not pro:
+        return {}
+    for ts_code in _candidate_ts_codes(code):
+        try:
+            df = pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+        except Exception:
+            continue
+        if df is None or df.empty:
+            continue
+        if 'trade_date' in df.columns:
+            df = df.sort_values('trade_date')
+        records = df.to_dict(orient='records')
+        latest = records[-1]
+        pct_change = _as_float(latest.get('pct_chg') or latest.get('PCT_CHG'))
+        if pct_change is None:
+            pct_change = _calc_pct(latest.get('close'), latest.get('pre_close'))
+        window_pct_change = None
+        window_span = min(SELF_ESTIMATE_HISTORY_DAYS, len(records) - 1)
+        if window_span > 0:
+            start_record = records[-(window_span + 1)]
+            window_pct_change = _calc_pct(latest.get('close'), start_record.get('close'))
+        return {
+            'name': '',
+            'pct_change': pct_change,
+            'window_pct_change': window_pct_change,
+            'trade_date': str(latest.get('trade_date') or ''),
+            'source': 'tushare_daily',
+        }
+    return {}
 
 
 def _estimate_by_holdings(nav_item: dict, holdings: list[dict], quotes: dict[str, dict]) -> dict | None:
     published_nav = _as_float(nav_item.get('published_nav'))
     if published_nav is None or not holdings or not quotes:
         return None
-    weighted_return = 0.0
+    nav_history = nav_item.get('nav_history') or []
+    current_weighted_return = 0.0
+    historical_weighted_return = 0.0
     covered_weight = 0.0
     holding_count = 0
+    historical_count = 0
     seen: set[str] = set()
     for item in holdings[:10]:
         stock_code = item['stock_code']
@@ -755,17 +858,32 @@ def _estimate_by_holdings(nav_item: dict, holdings: list[dict], quotes: dict[str
         if not quote:
             continue
         pct_change = _as_float(quote.get('pct_change'))
+        window_pct_change = _as_float(quote.get('window_pct_change'))
         weight = _as_float(item.get('weight'))
         if pct_change is None or weight is None or weight <= 0:
             continue
-        weighted_return += (weight / 100.0) * (pct_change / 100.0)
+        current_weighted_return += (weight / 100.0) * (pct_change / 100.0)
         covered_weight += weight
         holding_count += 1
+        if window_pct_change is not None:
+            historical_weighted_return += (weight / 100.0) * (window_pct_change / 100.0)
+            historical_count += 1
     if holding_count == 0 or covered_weight <= 0:
         return None
+    scale = 1.0
+    fund_window_return = _history_window_return(nav_history, SELF_ESTIMATE_HISTORY_DAYS)
+    if (
+        fund_window_return is not None
+        and historical_count > 0
+        and abs(historical_weighted_return) > 1e-6
+    ):
+        raw_scale = (fund_window_return / 100.0) / historical_weighted_return
+        scale = _clamp(raw_scale, 0.3, 1.7)
+        confidence = min(1.0, covered_weight / 100.0)
+        scale = 1.0 + (scale - 1.0) * confidence
     return {
-        'value': published_nav * (1.0 + weighted_return),
-        'growth': weighted_return * 100.0,
+        'value': published_nav * (1.0 + current_weighted_return * scale),
+        'growth': current_weighted_return * scale * 100.0,
         'coverage': covered_weight,
         'holding_count': holding_count,
     }
@@ -979,7 +1097,7 @@ def _render_page(
         {extra_columns_toggle}
       </form>
       {status_text}
-      <p class='sub'>默认按官方估算涨跌从大到小排序。官方估值会合并东方财富多个分类；若官方估算为空，可点“显示扩展列”查看自算估值，但自算只基于滞后的十大持仓，偏差会比较大，仅适合粗略参考。</p>
+      <p class='sub'>默认按官方估算涨跌从大到小排序。官方估值会合并东方财富多个分类；若官方估算为空，可点“显示扩展列”查看自算估值，自算会结合历史净值和持仓日线做校准，但仍只适合粗略参考。</p>
     </section>
     <section class='card scroll'>
       <table>
@@ -1239,6 +1357,21 @@ def _calc_pct(current, previous):
     if current_value is None or previous_value in {None, 0}:
         return None
     return (current_value / previous_value - 1.0) * 100.0
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _history_window_return(history: list[dict], days: int) -> float | None:
+    values = []
+    for item in history or []:
+        number = _as_float(item.get('nav'))
+        if number is not None:
+            values.append(number)
+    if len(values) <= days:
+        return None
+    return _calc_pct(values[-1], values[-(days + 1)])
 
 
 def _format_value(value) -> str:
