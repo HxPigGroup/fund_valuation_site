@@ -53,6 +53,11 @@ STOCK_SPOT_TIMEOUT_SECONDS = int(os.getenv('FUND_STOCK_SPOT_TIMEOUT_SECONDS', '1
 QUOTE_CACHE_TTL_SECONDS = int(os.getenv('FUND_QUOTE_CACHE_TTL_SECONDS', '300'))
 ESTIMATION_CACHE_TTL_SECONDS = int(os.getenv('FUND_ESTIMATION_CACHE_TTL_SECONDS', '300'))
 CODE_ESTIMATION_TIMEOUT_SECONDS = int(os.getenv('FUND_CODE_ESTIMATION_TIMEOUT_SECONDS', '6'))
+UPSTREAM_CONNECT_TIMEOUT_SECONDS = int(os.getenv('FUND_UPSTREAM_CONNECT_TIMEOUT_SECONDS', '5'))
+UPSTREAM_READ_TIMEOUT_SECONDS = int(os.getenv('FUND_UPSTREAM_READ_TIMEOUT_SECONDS', '15'))
+TUSHARE_TIMEOUT_SECONDS = int(os.getenv('FUND_TUSHARE_TIMEOUT_SECONDS', '12'))
+ESTIMATION_PAGE_SIZE = 20000
+ESTIMATION_MAX_PAGES = 5
 ESTIMATION_SYMBOLS = ('全部', '股票型', '混合型', '债券型', '指数型', 'QDII', 'ETF联接', 'LOF', '场内交易基金')
 
 _refresh_lock = threading.Lock()
@@ -60,7 +65,7 @@ _refresh_queue_lock = threading.Lock()
 _tushare_lock = threading.Lock()
 _tushare_pro = None
 _quote_cache = {'updated_at': 0.0, 'rows': {}}
-_estimation_cache = {'updated_at': 0.0, 'rows': {}}
+_estimation_cache = {'updated_at': 0.0, 'rows': {}, 'available': False}
 _refresh_queue: deque[str] = deque()
 _queued_refresh_phones: set[str] = set()
 _active_refresh_phone = ''
@@ -179,11 +184,13 @@ def main() -> None:
         CATALOG_FILE.write_text(json.dumps({'items': []}, ensure_ascii=False, indent=2), encoding='utf-8')
 
     _start_refresh_worker()
-    if _read_tracked_codes() and not _read_json(CACHE_FILE, {}).get('rows'):
+    _reset_stale_status('')
+    if _read_tracked_codes() and _cache_needs_refresh(CACHE_FILE):
         _trigger_refresh()
     for phone in _list_all_user_phones():
         _ensure_user_files(phone)
-        if _read_tracked_codes(phone) and not _read_json(_cache_file(phone), {}).get('rows'):
+        _reset_stale_status(phone)
+        if _read_tracked_codes(phone) and _cache_needs_refresh(_cache_file(phone)):
             _trigger_refresh(phone)
     _start_auto_refresh_loop()
 
@@ -237,18 +244,52 @@ def _refresh_worker_loop() -> None:
         with _refresh_lock:
             try:
                 _write_status('running', '正在刷新基金估值', phone=phone)
-                rows = _fetch_tracked_rows(_read_tracked_codes(phone))
+                rows = _fetch_tracked_rows_with_timeout(_read_tracked_codes(phone))
                 _cache_file(phone).write_text(
                     json.dumps({'rows': rows, 'refreshed_at': _now()}, ensure_ascii=False, indent=2),
                     encoding='utf-8',
                 )
-                _write_status('success', f'已刷新 {len(rows)} 只基金', _now(), phone=phone)
+                official_count = sum(
+                    1 for row in rows.values()
+                    if _as_float(row.get('estimate_growth')) is not None
+                )
+                message = f'已刷新 {len(rows)} 只基金'
+                if rows and official_count == 0:
+                    message += '，官方估值接口暂无数据'
+                _write_status('success', message, _now(), phone=phone)
             except Exception as exc:
+                _log(f'刷新失败 scope={phone or "public"}: {exc}')
                 _write_status('error', str(exc), phone=phone)
             finally:
                 with _refresh_queue_lock:
                     if _active_refresh_phone == scope_key:
                         _active_refresh_phone = ''
+
+
+def _fetch_tracked_rows_with_timeout(tracked_codes: list[str]) -> dict[str, dict]:
+    ctx = mp.get_context('fork')
+    result_queue: mp.Queue = ctx.Queue()
+    process = ctx.Process(target=_tracked_rows_worker, args=(tracked_codes, result_queue))
+    process.start()
+    process.join(240)
+    if process.is_alive():
+        process.terminate()
+        process.join(1)
+        raise TimeoutError('基金估值刷新超过 240 秒，已主动终止')
+    try:
+        status, result = result_queue.get(timeout=2)
+    except Exception as exc:
+        raise RuntimeError('刷新子进程没有返回结果') from exc
+    if status != 'success':
+        raise RuntimeError(str(result))
+    return result
+
+
+def _tracked_rows_worker(tracked_codes: list[str], result_queue: mp.Queue) -> None:
+    try:
+        result_queue.put(('success', _fetch_tracked_rows(tracked_codes)))
+    except Exception as exc:
+        result_queue.put(('error', str(exc)))
 
 
 def _fetch_tracked_rows(tracked_codes: list[str]) -> dict[str, dict]:
@@ -263,7 +304,7 @@ def _fetch_tracked_rows(tracked_codes: list[str]) -> dict[str, dict]:
     for code in tracked_codes:
         nav_item = _fetch_nav_info(code)
         estimate_item = estimate_map.get(code, {})
-        if estimate_item.get('estimate_value') is None:
+        if estimate_item.get('estimate_value') is None and _estimation_cache.get('available', True):
             code_estimate = _fetch_estimation_by_code(code)
             if code_estimate.get('estimate_value') is not None:
                 estimate_item = code_estimate
@@ -307,45 +348,79 @@ def _fetch_tracked_rows(tracked_codes: list[str]) -> dict[str, dict]:
 def _fetch_nav_info(code: str) -> dict[str, float | str | None]:
     name = _read_catalog_name(code)
     try:
-        frame = ak.fund_open_fund_info_em(symbol=code, indicator='单位净值走势', period='1月')
-        if not frame.empty:
-            normalized = _sort_nav_frame(frame)
-            records = normalized.to_dict(orient='records')
-            tail = records[-1]
-            columns = normalized.columns.tolist()
-            nav_col = _pick_column(columns, '单位净值')
-            date_col = _pick_column(columns, '净值日期') or _pick_column(columns, '日期')
-            growth_col = _pick_column(columns, '日增长率')
+        url = 'https://api.fund.eastmoney.com/f10/lsjz'
+        response = requests.get(
+            url,
+            params={'fundCode': code, 'pageIndex': 1, 'pageSize': 30},
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': 'https://fundf10.eastmoney.com/',
+            },
+            timeout=(UPSTREAM_CONNECT_TIMEOUT_SECONDS, UPSTREAM_READ_TIMEOUT_SECONDS),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get('Data') if isinstance(payload, dict) else None
+        raw_records = data.get('LSJZList', []) if isinstance(data, dict) else []
+        if raw_records:
+            records = list(reversed(raw_records))
+            latest = records[-1]
             return {
                 'name': name,
-                'published_nav': _as_float(tail.get(nav_col)) if nav_col else None,
-                'published_growth': _as_float(tail.get(growth_col)) if growth_col else None,
-                'month_growth': _calc_recent_growth(records, nav_col, date_col) if nav_col else None,
+                'published_nav': _as_float(latest.get('DWJZ')),
+                'published_growth': _as_float(latest.get('JZZZL')),
+                'month_growth': _calc_recent_growth(records, 'DWJZ', 'FSRQ'),
             }
-    except Exception:
+    except (requests.RequestException, ValueError, TypeError, AttributeError):
         pass
 
-    pro = _get_tushare_pro()
-    if not pro:
+    return _fetch_nav_info_tushare(code, name)
+
+
+def _fetch_nav_info_tushare(code: str, name: str) -> dict[str, float | str | None]:
+    ctx = mp.get_context('fork')
+    queue: mp.Queue = ctx.Queue()
+    process = ctx.Process(target=_nav_worker_tushare, args=(code, name, queue))
+    process.start()
+    process.join(TUSHARE_TIMEOUT_SECONDS)
+    if process.is_alive():
+        process.terminate()
+        process.join(1)
         return {'name': name, 'published_nav': None, 'published_growth': None, 'month_growth': None}
-    for ts_code in _candidate_fund_ts_codes(code):
-        try:
-            df = pro.fund_nav(ts_code=ts_code, limit=25)
-        except Exception:
-            continue
-        if df is None or df.empty:
-            continue
-        if 'nav_date' in df.columns:
-            df = df.sort_values('nav_date')
-        records = df.to_dict(orient='records')
-        row = records[-1]
-        return {
-            'name': name,
-            'published_nav': _as_float(row.get('unit_nav')),
-            'published_growth': _calc_pct(row.get('unit_nav'), row.get('pre_unit_nav')),
-            'month_growth': _calc_recent_growth(records, 'unit_nav', 'nav_date'),
-        }
-    return {'name': name, 'published_nav': None, 'published_growth': None, 'month_growth': None}
+    try:
+        result = queue.get_nowait()
+    except Exception:
+        result = None
+    return result or {'name': name, 'published_nav': None, 'published_growth': None, 'month_growth': None}
+
+
+def _nav_worker_tushare(code: str, name: str, queue: mp.Queue) -> None:
+    try:
+        pro = _get_tushare_pro()
+        if not pro:
+            queue.put(None)
+            return
+        for ts_code in _candidate_fund_ts_codes(code):
+            try:
+                df = pro.fund_nav(ts_code=ts_code, limit=25)
+            except Exception:
+                continue
+            if df is None or df.empty:
+                continue
+            if 'nav_date' in df.columns:
+                df = df.sort_values('nav_date')
+            records = df.to_dict(orient='records')
+            row = records[-1]
+            queue.put({
+                'name': name,
+                'published_nav': _as_float(row.get('unit_nav')),
+                'published_growth': _calc_pct(row.get('unit_nav'), row.get('pre_unit_nav')),
+                'month_growth': _calc_recent_growth(records, 'unit_nav', 'nav_date'),
+            })
+            return
+        queue.put(None)
+    except Exception:
+        queue.put(None)
 
 
 def _fetch_estimation_map_cached() -> dict[str, dict]:
@@ -354,14 +429,62 @@ def _fetch_estimation_map_cached() -> dict[str, dict]:
         return dict(_estimation_cache.get('rows', {}))
 
     estimate_map: dict[str, dict] = {}
-    for symbol in ESTIMATION_SYMBOLS:
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://fund.eastmoney.com/',
+    }
+    for page in range(1, ESTIMATION_MAX_PAGES + 1):
         try:
-            frame = ak.fund_value_estimation_em(symbol=symbol)
-        except Exception:
-            continue
-        _merge_estimation_frame(estimate_map, frame, symbol)
+            response = requests.get(
+                'https://api.fund.eastmoney.com/FundGuZhi/GetFundGZList',
+                params={
+                    'type': 1,
+                    'sort': 3,
+                    'orderType': 'desc',
+                    'canbuy': 0,
+                    'pageIndex': page,
+                    'pageSize': ESTIMATION_PAGE_SIZE,
+                    '_': int(time.time() * 1000),
+                },
+                headers=headers,
+                timeout=(UPSTREAM_CONNECT_TIMEOUT_SECONDS, UPSTREAM_READ_TIMEOUT_SECONDS),
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            _log(f'官方估值接口请求失败 page={page}: {exc}')
+            break
+
+        data = payload.get('Data') if isinstance(payload, dict) else None
+        raw_items = data.get('list', []) if isinstance(data, dict) else []
+        if not raw_items:
+            err_code = payload.get('ErrCode') if isinstance(payload, dict) else ''
+            err_msg = payload.get('ErrMsg') if isinstance(payload, dict) else '响应格式异常'
+            _log(f'官方估值接口无数据 page={page} err={err_code} message={err_msg}')
+            break
+
+        for record in raw_items:
+            code = _normalize_code(str(record.get('bzdm', '')))
+            if not code:
+                continue
+            item = {
+                'name': str(record.get('jjjc') or '').strip(),
+                'estimate_value': _as_float(record.get('gsz')),
+                'estimate_growth': _as_float(record.get('gszzl')),
+                'deviation': _as_float(record.get('gspc')),
+                'source': 'eastmoney:list',
+            }
+            existing = estimate_map.get(code, {})
+            if existing.get('estimate_value') is None and item.get('estimate_value') is not None:
+                estimate_map[code] = item
+            elif code not in estimate_map:
+                estimate_map[code] = item
+
+        if len(raw_items) < ESTIMATION_PAGE_SIZE:
+            break
     _estimation_cache['updated_at'] = now
     _estimation_cache['rows'] = estimate_map
+    _estimation_cache['available'] = bool(estimate_map)
     return dict(estimate_map)
 
 
@@ -406,7 +529,15 @@ def _fetch_estimation_by_code(code: str) -> dict:
     }
     for _ in range(2):
         try:
-            text = requests.get(url, headers=headers, timeout=CODE_ESTIMATION_TIMEOUT_SECONDS).text.strip()
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=(UPSTREAM_CONNECT_TIMEOUT_SECONDS, CODE_ESTIMATION_TIMEOUT_SECONDS),
+                allow_redirects=False,
+            )
+            if response.status_code != 200:
+                continue
+            text = response.text.strip()
         except Exception:
             continue
         match = re.search(r'jsonpgz\((.*)\);?$', text)
@@ -986,6 +1117,26 @@ def _read_json(path: Path, default):
         return default
 
 
+def _cache_needs_refresh(path: Path) -> bool:
+    payload = _read_json(path, {})
+    if not isinstance(payload, dict) or not payload.get('rows'):
+        return True
+    refreshed_at = str(payload.get('refreshed_at') or '').strip()
+    if not refreshed_at:
+        return True
+    try:
+        refreshed_time = datetime.fromisoformat(refreshed_at)
+    except ValueError:
+        return True
+    return (datetime.now() - refreshed_time).total_seconds() >= AUTO_REFRESH_SECONDS
+
+
+def _reset_stale_status(phone: str = '') -> None:
+    status = _read_json(_status_file(phone), {})
+    if isinstance(status, dict) and status.get('status') == 'running':
+        _write_status('error', '服务重启后已清理未完成的刷新任务', phone=phone)
+
+
 def _write_status(status: str, message: str, updated_at: str = '', phone: str = '') -> None:
     payload = {'status': status, 'message': message, 'updated_at': updated_at or _now()}
     _status_file(phone).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -1124,6 +1275,10 @@ def _sort_codes_by_estimate_growth(tracked_codes: list[str], cached_rows: dict[s
 
 def _now() -> str:
     return datetime.now().isoformat(timespec='seconds')
+
+
+def _log(message: str) -> None:
+    print(f'[{_now()}] {message}', flush=True)
 
 
 def _start_auto_refresh_loop() -> None:
