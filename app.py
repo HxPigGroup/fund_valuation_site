@@ -48,6 +48,7 @@ _load_env_file()
 HOST = '0.0.0.0'
 PORT = 11452
 AUTO_REFRESH_SECONDS = int(os.getenv('FUND_AUTO_REFRESH_SECONDS', '900'))
+AUTO_REFRESH_LOOP_ENABLED = os.getenv('FUND_ENABLE_AUTO_REFRESH_LOOP', '0') == '1'
 HOLDINGS_TIMEOUT_SECONDS = int(os.getenv('FUND_HOLDINGS_TIMEOUT_SECONDS', '12'))
 STOCK_SPOT_TIMEOUT_SECONDS = int(os.getenv('FUND_STOCK_SPOT_TIMEOUT_SECONDS', '18'))
 QUOTE_CACHE_TTL_SECONDS = int(os.getenv('FUND_QUOTE_CACHE_TTL_SECONDS', '300'))
@@ -192,7 +193,8 @@ def main() -> None:
         _reset_stale_status(phone)
         if _read_tracked_codes(phone) and _cache_needs_refresh(_cache_file(phone)):
             _trigger_refresh(phone)
-    _start_auto_refresh_loop()
+    if AUTO_REFRESH_LOOP_ENABLED:
+        _start_auto_refresh_loop()
 
     handler = partial(FundHandler, directory=str(BASE_DIR))
     server = ThreadingHTTPServer((HOST, PORT), handler)
@@ -903,9 +905,9 @@ def _render_page(
     table_html = '\n'.join(rows_html) or "<tr><td colspan='9'>当前没有跟踪的基金。</td></tr>"
     masked_phone = _mask_phone(phone)
     page_desc = (
-        f"个人页：{escape(masked_phone)} | 页面标识：{escape(phone)} | 最近缓存时间: {escape(refreshed_at or '暂无')} | 自动刷新间隔: {AUTO_REFRESH_SECONDS // 60} 分钟"
+        f"个人页：{escape(masked_phone)} | 页面标识：{escape(phone)} | 最近缓存时间: {escape(refreshed_at or '暂无')} | 后台自动刷新: {'开启' if AUTO_REFRESH_LOOP_ENABLED else '关闭'}"
         if phone
-        else f"公共页面 | 最近缓存时间: {escape(refreshed_at or '暂无')} | 自动刷新间隔: {AUTO_REFRESH_SECONDS // 60} 分钟"
+        else f"公共页面 | 最近缓存时间: {escape(refreshed_at or '暂无')} | 后台自动刷新: {'开启' if AUTO_REFRESH_LOOP_ENABLED else '关闭'}"
     )
     page_tools = (
         f"""
