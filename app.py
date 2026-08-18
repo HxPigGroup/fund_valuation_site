@@ -267,11 +267,16 @@ def _refresh_worker_loop() -> None:
                     1 for row in rows.values()
                     if _as_float(row.get('sina_estimate_growth')) is not None
                 )
+                sina_holdings_count = sum(
+                    1 for row in rows.values()
+                    if _as_float(row.get('sina_holdings_estimate_growth')) is not None
+                )
                 message = (
                     f'已刷新 {len(rows)} 只基金，'
-                    f'东方财富估值 {eastmoney_count} 只，新浪估值 {sina_count} 只'
+                    f'新浪估值 {sina_count} 只，新浪重仓估值 {sina_holdings_count} 只，'
+                    f'东方财富估值 {eastmoney_count} 只'
                 )
-                if rows and eastmoney_count == 0 and sina_count == 0:
+                if rows and eastmoney_count == 0 and sina_count == 0 and sina_holdings_count == 0:
                     message += '，盘中估值接口暂无数据'
                 _write_status('success', message, _now(), phone=phone)
             except Exception as exc:
@@ -328,7 +333,15 @@ def _fetch_tracked_rows(tracked_codes: list[str]) -> dict[str, dict]:
             if code_estimate.get('estimate_value') is not None:
                 estimate_item = code_estimate
         has_official_estimate = estimate_item.get('estimate_value') is not None
-        has_sina_estimate = sina_estimate_item.get('estimate_value') is not None
+        has_sina_estimate = any(
+            sina_estimate_item.get(field) is not None
+            for field in (
+                'estimate_value',
+                'estimate_growth',
+                'holdings_estimate_value',
+                'holdings_estimate_growth',
+            )
+        )
         self_estimate = None
         holdings_source = 'none'
         quote_source = 'none'
@@ -354,6 +367,8 @@ def _fetch_tracked_rows(tracked_codes: list[str]) -> dict[str, dict]:
             'estimate_growth': _format_percent(estimate_item.get('estimate_growth')),
             'sina_estimate_value': _format_value(sina_estimate_item.get('estimate_value')),
             'sina_estimate_growth': _format_percent(sina_estimate_item.get('estimate_growth')),
+            'sina_holdings_estimate_value': _format_value(sina_estimate_item.get('holdings_estimate_value')),
+            'sina_holdings_estimate_growth': _format_percent(sina_estimate_item.get('holdings_estimate_growth')),
             'sina_estimate_time': str(sina_estimate_item.get('estimate_time') or ''),
             'published_nav': _format_value(nav_item.get('published_nav')),
             'published_growth': _format_percent(nav_item.get('published_growth')),
@@ -646,7 +661,14 @@ def _parse_sina_estimation_payload(text: str) -> dict:
             continue
         estimate_value = _as_float(point.get('pre_nav'))
         estimate_growth = _as_float(point.get('nav_pct'))
-        if estimate_value is None and estimate_growth is None:
+        holdings_estimate_value = _as_float(point.get('pre_nav2'))
+        holdings_estimate_growth = _as_float(point.get('nav2_pct'))
+        if all(value is None for value in (
+            estimate_value,
+            estimate_growth,
+            holdings_estimate_value,
+            holdings_estimate_growth,
+        )):
             continue
         estimate_time = ' '.join(
             value for value in (
@@ -658,6 +680,8 @@ def _parse_sina_estimation_payload(text: str) -> dict:
         return {
             'estimate_value': estimate_value,
             'estimate_growth': estimate_growth,
+            'holdings_estimate_value': holdings_estimate_value,
+            'holdings_estimate_growth': holdings_estimate_growth,
             'estimate_time': estimate_time,
             'source': 'sina',
         }
@@ -1077,6 +1101,7 @@ def _render_page(
         row = cached_rows.get(code, {})
         estimate_growth_class = _tone_class(row.get('estimate_growth'))
         sina_estimate_growth_class = _tone_class(row.get('sina_estimate_growth'))
+        sina_holdings_estimate_growth_class = _tone_class(row.get('sina_holdings_estimate_growth'))
         self_estimate_growth_class = _tone_class(row.get('self_estimate_growth'))
         published_growth_class = _tone_class(row.get('published_growth'))
         month_growth_class = _tone_class(row.get('month_growth'))
@@ -1095,15 +1120,24 @@ def _render_page(
             if sina_estimate_growth_text
             else "<span class='empty-hint'>暂无新浪估算，可展开看自算</span>"
         )
+        sina_holdings_estimate_value_text = _blank_if_empty(row.get('sina_holdings_estimate_value'))
+        sina_holdings_estimate_growth_text = _blank_if_empty(row.get('sina_holdings_estimate_growth'))
+        sina_holdings_estimate_growth_html = (
+            escape(sina_holdings_estimate_growth_text)
+            if sina_holdings_estimate_growth_text
+            else "<span class='empty-hint'>暂无新浪重仓估算</span>"
+        )
         rows_html.append(
             f"""
             <tr>
               <td>{escape(code)}</td>
               <td>{escape(str(row.get('name', '---')))}</td>
-              <td>{escape(estimate_value_text)}</td>
-              <td class='{estimate_growth_cell_class}'>{estimate_growth_html}</td>
               <td>{escape(sina_estimate_value_text)}</td>
               <td class='primary-col {sina_estimate_growth_class}'>{sina_estimate_growth_html}</td>
+              <td>{escape(sina_holdings_estimate_value_text)}</td>
+              <td class='primary-col {sina_holdings_estimate_growth_class}'>{sina_holdings_estimate_growth_html}</td>
+              <td>{escape(estimate_value_text)}</td>
+              <td class='{estimate_growth_cell_class}'>{estimate_growth_html}</td>
               <td class='optional-col'>{escape(str(row.get('self_estimate_value', '---')))}</td>
               <td class='optional-col {self_estimate_growth_class}'>{escape(str(row.get('self_estimate_growth', '---')))}</td>
               <td class='{published_growth_class}'>{escape(str(row.get('published_growth', '---')))}</td>
@@ -1118,7 +1152,7 @@ def _render_page(
             </tr>
             """
         )
-    table_html = '\n'.join(rows_html) or "<tr><td colspan='11'>当前没有跟踪的基金。</td></tr>"
+    table_html = '\n'.join(rows_html) or "<tr><td colspan='13'>当前没有跟踪的基金。</td></tr>"
     masked_phone = _mask_phone(phone)
     page_desc = (
         f"个人页：{escape(masked_phone)} | 页面标识：{escape(phone)} | 最近缓存时间: {escape(refreshed_at or '暂无')} | 后台自动刷新: {'开启' if AUTO_REFRESH_LOOP_ENABLED else '关闭'}"
@@ -1195,13 +1229,13 @@ def _render_page(
         {extra_columns_toggle}
       </form>
       {status_text}
-      <p class='sub'>页面同时展示东方财富与新浪两组盘中估值，默认优先按东方财富估算涨跌排序，缺失时使用新浪估算涨跌；两者都为空时，可点“显示扩展列”查看自算估值。</p>
+      <p class='sub'>页面依次展示新浪估算、前十大重仓加权估算和东方财富估算，默认仍优先按东方财富估算涨跌排序，缺失时使用新浪估算涨跌；这些来源都为空时，可点“显示扩展列”查看自算估值。</p>
     </section>
     <section class='card scroll'>
       <table>
         <thead>
           <tr>
-            <th>基金代码</th><th>基金名称</th><th>东方财富估算值</th><th class='primary-col'>东方财富估算涨跌</th><th>新浪估算值</th><th class='primary-col'>新浪估算涨跌</th><th class='optional-col'>自算估值</th><th class='optional-col'>自算涨跌</th><th>昨日增长</th><th>近一月增长</th><th>操作</th>
+            <th>基金代码</th><th>基金名称</th><th>新浪估算值</th><th class='primary-col'>新浪估算涨跌</th><th>新浪重仓估算值</th><th class='primary-col'>新浪重仓估算涨跌</th><th>东方财富估算值</th><th class='primary-col'>东方财富估算涨跌</th><th class='optional-col'>自算估值</th><th class='optional-col'>自算涨跌</th><th>昨日增长</th><th>近一月增长</th><th>操作</th>
           </tr>
         </thead>
         <tbody>{table_html}</tbody>
