@@ -328,10 +328,11 @@ def _fetch_tracked_rows(tracked_codes: list[str]) -> dict[str, dict]:
             if code_estimate.get('estimate_value') is not None:
                 estimate_item = code_estimate
         has_official_estimate = estimate_item.get('estimate_value') is not None
+        has_sina_estimate = sina_estimate_item.get('estimate_value') is not None
         self_estimate = None
         holdings_source = 'none'
         quote_source = 'none'
-        if not has_official_estimate:
+        if not has_official_estimate and not has_sina_estimate:
             holdings, holdings_source = _fetch_holdings(code)
             quotes, quote_source = _fetch_stock_quotes([item['stock_code'] for item in holdings[:10]])
             self_estimate = _estimate_by_holdings(nav_item, holdings, quotes)
@@ -339,7 +340,7 @@ def _fetch_tracked_rows(tracked_codes: list[str]) -> dict[str, dict]:
         source_parts = []
         if has_official_estimate:
             source_parts.append('eastmoney')
-        if sina_estimate_item.get('estimate_value') is not None:
+        if has_sina_estimate:
             source_parts.append('sina')
         if self_estimate:
             source_parts.append(f'self:{holdings_source}+{quote_source}')
