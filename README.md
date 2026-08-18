@@ -6,7 +6,7 @@
 
 - 手动新增/删除跟踪基金
 - 自动刷新基金净值与估值
-- 同时展示官方估算值、官方估算涨跌、昨日增长和近一月增长
+- 同时展示东方财富与新浪两组盘中估值、昨日增长和近一月增长
 - 支持按手机号隔离个人跟踪页
 - 支持 `AkShare + Tushare` 多数据源回退
 - 适合部署在 Linux 服务器并长期运行
@@ -23,7 +23,7 @@
 - 手动刷新与定时刷新
 - 公共页面与按手机号区分的个人页面
 - 昨日增长与近一月增长展示
-- 官方估算值与官方估算涨跌展示
+- 东方财富与新浪盘中估算值、估算涨跌同时展示
 - 官方估值缺失时，可展开查看基于前十大重仓和实时股票涨跌的自算估值
 - 数据源回退：`AkShare` 失败时自动尝试 `Tushare`
 - 本地缓存与限频，尽量减少对上游接口的频繁请求
@@ -31,8 +31,10 @@
 
 页面字段包括：
 
-- `官方估算值`
-- `官方估算涨跌`
+- `东方财富估算值`
+- `东方财富估算涨跌`
+- `新浪估算值`
+- `新浪估算涨跌`
 - `昨日增长`
 - `近一月增长`
 
@@ -98,6 +100,7 @@ FUND_STOCK_SPOT_TIMEOUT_SECONDS=18
 FUND_QUOTE_CACHE_TTL_SECONDS=300
 FUND_ESTIMATION_CACHE_TTL_SECONDS=300
 FUND_CODE_ESTIMATION_TIMEOUT_SECONDS=6
+FUND_SINA_ESTIMATION_TIMEOUT_SECONDS=8
 ```
 
 字段说明：
@@ -109,6 +112,7 @@ FUND_CODE_ESTIMATION_TIMEOUT_SECONDS=6
 - `FUND_QUOTE_CACHE_TTL_SECONDS`: 股票实时行情缓存时长
 - `FUND_ESTIMATION_CACHE_TTL_SECONDS`: 官方估值缓存时长
 - `FUND_CODE_ESTIMATION_TIMEOUT_SECONDS`: 按基金代码查询官方估值的超时秒数
+- `FUND_SINA_ESTIMATION_TIMEOUT_SECONDS`: 新浪盘中估值接口的读取超时秒数
 
 ## 本地启动
 
@@ -163,7 +167,7 @@ systemctl status fund-valuation.service
 回退：
 - `Tushare fund_nav`
 
-### 2. 官方估算值
+### 2. 盘中估算值
 
 优先：
 - `AkShare fund_value_estimation_em`
@@ -173,6 +177,9 @@ systemctl status fund-valuation.service
 
 回退：
 - 天天基金按代码估值接口 `fundgz.1234567.com.cn`
+
+并行补充：
+- 新浪财经 `FdFundService.getEstimateNetworthPic`，读取最新分钟点的估算净值与涨跌
 
 ### 3. 基金持仓
 

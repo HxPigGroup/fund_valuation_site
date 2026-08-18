@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from functools import partial
 from html import escape
@@ -57,6 +58,7 @@ STOCK_SPOT_TIMEOUT_SECONDS = int(os.getenv('FUND_STOCK_SPOT_TIMEOUT_SECONDS', '1
 QUOTE_CACHE_TTL_SECONDS = int(os.getenv('FUND_QUOTE_CACHE_TTL_SECONDS', '300'))
 ESTIMATION_CACHE_TTL_SECONDS = int(os.getenv('FUND_ESTIMATION_CACHE_TTL_SECONDS', '300'))
 CODE_ESTIMATION_TIMEOUT_SECONDS = int(os.getenv('FUND_CODE_ESTIMATION_TIMEOUT_SECONDS', '6'))
+SINA_ESTIMATION_TIMEOUT_SECONDS = int(os.getenv('FUND_SINA_ESTIMATION_TIMEOUT_SECONDS', '8'))
 UPSTREAM_CONNECT_TIMEOUT_SECONDS = int(os.getenv('FUND_UPSTREAM_CONNECT_TIMEOUT_SECONDS', '5'))
 UPSTREAM_READ_TIMEOUT_SECONDS = int(os.getenv('FUND_UPSTREAM_READ_TIMEOUT_SECONDS', '15'))
 TUSHARE_TIMEOUT_SECONDS = int(os.getenv('FUND_TUSHARE_TIMEOUT_SECONDS', '12'))
@@ -65,6 +67,7 @@ ESTIMATION_MAX_PAGES = 5
 SELF_ESTIMATE_HISTORY_DAYS = int(os.getenv('FUND_SELF_ESTIMATE_HISTORY_DAYS', '5'))
 TUSHARE_DAILY_LOOKBACK_DAYS = int(os.getenv('FUND_TUSHARE_DAILY_LOOKBACK_DAYS', '20'))
 ESTIMATION_SYMBOLS = ('全部', '股票型', '混合型', '债券型', '指数型', 'QDII', 'ETF联接', 'LOF', '场内交易基金')
+SINA_ESTIMATION_URL = 'https://stock.finance.sina.com.cn/fundInfo/api/openapi.php/FdFundService.getEstimateNetworthPic'
 
 _refresh_lock = threading.Lock()
 _refresh_queue_lock = threading.Lock()
@@ -256,13 +259,20 @@ def _refresh_worker_loop() -> None:
                     json.dumps({'rows': rows, 'refreshed_at': _now()}, ensure_ascii=False, indent=2),
                     encoding='utf-8',
                 )
-                official_count = sum(
+                eastmoney_count = sum(
                     1 for row in rows.values()
                     if _as_float(row.get('estimate_growth')) is not None
                 )
-                message = f'已刷新 {len(rows)} 只基金'
-                if rows and official_count == 0:
-                    message += '，官方估值接口暂无数据'
+                sina_count = sum(
+                    1 for row in rows.values()
+                    if _as_float(row.get('sina_estimate_growth')) is not None
+                )
+                message = (
+                    f'已刷新 {len(rows)} 只基金，'
+                    f'东方财富估值 {eastmoney_count} 只，新浪估值 {sina_count} 只'
+                )
+                if rows and eastmoney_count == 0 and sina_count == 0:
+                    message += '，盘中估值接口暂无数据'
                 _write_status('success', message, _now(), phone=phone)
             except Exception as exc:
                 _log(f'刷新失败 scope={phone or "public"}: {exc}')
@@ -304,6 +314,7 @@ def _fetch_tracked_rows(tracked_codes: list[str]) -> dict[str, dict]:
         return {}
 
     estimate_map = _fetch_estimation_map_cached()
+    sina_estimate_map = _fetch_sina_estimation_map(tracked_codes)
     catalog_items = _read_json(CATALOG_FILE, {}).get('items', [])
     catalog_name_map = {str(item.get('code', '')).zfill(6): str(item.get('name', '')).strip() for item in catalog_items}
     rows: dict[str, dict] = {}
@@ -311,6 +322,7 @@ def _fetch_tracked_rows(tracked_codes: list[str]) -> dict[str, dict]:
     for code in tracked_codes:
         nav_item = _fetch_nav_info(code)
         estimate_item = estimate_map.get(code, {})
+        sina_estimate_item = sina_estimate_map.get(code, {})
         if estimate_item.get('estimate_value') is None and _estimation_cache.get('available', True):
             code_estimate = _fetch_estimation_by_code(code)
             if code_estimate.get('estimate_value') is not None:
@@ -326,7 +338,9 @@ def _fetch_tracked_rows(tracked_codes: list[str]) -> dict[str, dict]:
         name = nav_item.get('name') or estimate_item.get('name') or catalog_name_map.get(code) or code
         source_parts = []
         if has_official_estimate:
-            source_parts.append('official')
+            source_parts.append('eastmoney')
+        if sina_estimate_item.get('estimate_value') is not None:
+            source_parts.append('sina')
         if self_estimate:
             source_parts.append(f'self:{holdings_source}+{quote_source}')
         if not source_parts:
@@ -337,6 +351,9 @@ def _fetch_tracked_rows(tracked_codes: list[str]) -> dict[str, dict]:
             'name': str(name).strip(),
             'estimate_value': _format_value(estimate_item.get('estimate_value')),
             'estimate_growth': _format_percent(estimate_item.get('estimate_growth')),
+            'sina_estimate_value': _format_value(sina_estimate_item.get('estimate_value')),
+            'sina_estimate_growth': _format_percent(sina_estimate_item.get('estimate_growth')),
+            'sina_estimate_time': str(sina_estimate_item.get('estimate_time') or ''),
             'published_nav': _format_value(nav_item.get('published_nav')),
             'published_growth': _format_percent(nav_item.get('published_growth')),
             'month_growth': _format_percent(nav_item.get('month_growth')),
@@ -572,6 +589,76 @@ def _fetch_estimation_by_code(code: str) -> dict:
             'estimate_growth': _as_float(payload.get('gszzl')),
             'deviation': None,
             'source': 'eastmoney:code',
+        }
+    return {}
+
+
+def _fetch_sina_estimation_map(codes: list[str]) -> dict[str, dict]:
+    if not codes:
+        return {}
+
+    worker_count = min(8, len(codes))
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        results = pool.map(_fetch_sina_estimation, codes)
+        return {
+            code: result
+            for code, result in zip(codes, results)
+            if result
+        }
+
+
+def _fetch_sina_estimation(code: str) -> dict:
+    try:
+        response = requests.get(
+            SINA_ESTIMATION_URL,
+            params={'symbol': code, 'callback': 'cb'},
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': f'https://finance.sina.com.cn/fund/quotes/{code}/bc.shtml',
+            },
+            timeout=(UPSTREAM_CONNECT_TIMEOUT_SECONDS, SINA_ESTIMATION_TIMEOUT_SECONDS),
+        )
+        response.raise_for_status()
+        return _parse_sina_estimation_payload(response.text)
+    except (requests.RequestException, ValueError, TypeError, json.JSONDecodeError) as exc:
+        _log(f'新浪估值接口请求失败 code={code}: {exc}')
+        return {}
+
+
+def _parse_sina_estimation_payload(text: str) -> dict:
+    match = re.search(r'\bcb\((\{.*\})\)\s*;?\s*$', text, flags=re.DOTALL)
+    if not match:
+        return {}
+
+    payload = json.loads(match.group(1))
+    result = payload.get('result') if isinstance(payload, dict) else None
+    status = result.get('status') if isinstance(result, dict) else None
+    if not isinstance(status, dict) or _as_float(status.get('code')) != 0:
+        return {}
+    data = result.get('data')
+    points = data.get('networth') if isinstance(data, dict) else None
+    if not isinstance(points, list):
+        return {}
+
+    for point in reversed(points):
+        if not isinstance(point, dict):
+            continue
+        estimate_value = _as_float(point.get('pre_nav'))
+        estimate_growth = _as_float(point.get('nav_pct'))
+        if estimate_value is None and estimate_growth is None:
+            continue
+        estimate_time = ' '.join(
+            value for value in (
+                str(point.get('pre_date') or '').strip(),
+                str(point.get('min_time') or '').strip(),
+            )
+            if value
+        )
+        return {
+            'estimate_value': estimate_value,
+            'estimate_growth': estimate_growth,
+            'estimate_time': estimate_time,
+            'source': 'sina',
         }
     return {}
 
@@ -988,6 +1075,7 @@ def _render_page(
     for code in sorted_codes:
         row = cached_rows.get(code, {})
         estimate_growth_class = _tone_class(row.get('estimate_growth'))
+        sina_estimate_growth_class = _tone_class(row.get('sina_estimate_growth'))
         self_estimate_growth_class = _tone_class(row.get('self_estimate_growth'))
         published_growth_class = _tone_class(row.get('published_growth'))
         month_growth_class = _tone_class(row.get('month_growth'))
@@ -997,7 +1085,14 @@ def _render_page(
         estimate_growth_html = (
             escape(estimate_growth_text)
             if estimate_growth_text
-            else "<span class='empty-hint'>暂无官方估算，点“显示扩展列”看自算</span>"
+            else "<span class='empty-hint'>暂无东方财富估算</span>"
+        )
+        sina_estimate_value_text = _blank_if_empty(row.get('sina_estimate_value'))
+        sina_estimate_growth_text = _blank_if_empty(row.get('sina_estimate_growth'))
+        sina_estimate_growth_html = (
+            escape(sina_estimate_growth_text)
+            if sina_estimate_growth_text
+            else "<span class='empty-hint'>暂无新浪估算，可展开看自算</span>"
         )
         rows_html.append(
             f"""
@@ -1006,6 +1101,8 @@ def _render_page(
               <td>{escape(str(row.get('name', '---')))}</td>
               <td>{escape(estimate_value_text)}</td>
               <td class='{estimate_growth_cell_class}'>{estimate_growth_html}</td>
+              <td>{escape(sina_estimate_value_text)}</td>
+              <td class='primary-col {sina_estimate_growth_class}'>{sina_estimate_growth_html}</td>
               <td class='optional-col'>{escape(str(row.get('self_estimate_value', '---')))}</td>
               <td class='optional-col {self_estimate_growth_class}'>{escape(str(row.get('self_estimate_growth', '---')))}</td>
               <td class='{published_growth_class}'>{escape(str(row.get('published_growth', '---')))}</td>
@@ -1020,7 +1117,7 @@ def _render_page(
             </tr>
             """
         )
-    table_html = '\n'.join(rows_html) or "<tr><td colspan='9'>当前没有跟踪的基金。</td></tr>"
+    table_html = '\n'.join(rows_html) or "<tr><td colspan='11'>当前没有跟踪的基金。</td></tr>"
     masked_phone = _mask_phone(phone)
     page_desc = (
         f"个人页：{escape(masked_phone)} | 页面标识：{escape(phone)} | 最近缓存时间: {escape(refreshed_at or '暂无')} | 后台自动刷新: {'开启' if AUTO_REFRESH_LOOP_ENABLED else '关闭'}"
@@ -1097,13 +1194,13 @@ def _render_page(
         {extra_columns_toggle}
       </form>
       {status_text}
-      <p class='sub'>默认按官方估算涨跌从大到小排序。官方估值会合并东方财富多个分类；若官方估算为空，可点“显示扩展列”查看自算估值，自算会结合历史净值和持仓日线做校准，但仍只适合粗略参考。</p>
+      <p class='sub'>页面同时展示东方财富与新浪两组盘中估值，默认优先按东方财富估算涨跌排序，缺失时使用新浪估算涨跌；两者都为空时，可点“显示扩展列”查看自算估值。</p>
     </section>
     <section class='card scroll'>
       <table>
         <thead>
           <tr>
-            <th>基金代码</th><th>基金名称</th><th>官方估算值</th><th class='primary-col'>官方估算涨跌</th><th class='optional-col'>自算估值</th><th class='optional-col'>自算涨跌</th><th>昨日增长</th><th>近一月增长</th><th>操作</th>
+            <th>基金代码</th><th>基金名称</th><th>东方财富估算值</th><th class='primary-col'>东方财富估算涨跌</th><th>新浪估算值</th><th class='primary-col'>新浪估算涨跌</th><th class='optional-col'>自算估值</th><th class='optional-col'>自算涨跌</th><th>昨日增长</th><th>近一月增长</th><th>操作</th>
           </tr>
         </thead>
         <tbody>{table_html}</tbody>
@@ -1402,7 +1499,10 @@ def _tone_class(value) -> str:
 
 def _sort_codes_by_estimate_growth(tracked_codes: list[str], cached_rows: dict[str, dict]) -> list[str]:
     def sort_key(code: str) -> tuple[bool, float]:
-        value = _as_float(cached_rows.get(code, {}).get('estimate_growth'))
+        row = cached_rows.get(code, {})
+        value = _as_float(row.get('estimate_growth'))
+        if value is None:
+            value = _as_float(row.get('sina_estimate_growth'))
         return (value is not None, value if value is not None else float('-inf'))
 
     return sorted(tracked_codes, key=sort_key, reverse=True)
